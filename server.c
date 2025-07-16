@@ -1,4 +1,3 @@
-// server.c – Server FIFO SHA-256 (thread Pool limitato, cache, gestione richieste duplicate)
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -12,9 +11,8 @@
 
 // Nomi FIFO per comunicazione client-server
 #define FIFO_IN  "/tmp/fifo_in"
-// Nota: FIFO_OUT non è utilizzata in questo modello (ogni client crea la propria FIFO di risposta)
-// #define FIFO_OUT "/tmp/fifo_out"
 
+#define MAX_MSG_SIZE 1024
 #define MAX_CACHE_SIZE 100
 #define MAX_QUEUE      100
 #define MAX_THREADS    4   // Limite massimo di thread worker simultanei
@@ -31,7 +29,7 @@ static pthread_mutex_t cache_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // Struttura per rappresentare una richiesta nella coda (filepath + fifo client + dimensione file)
 typedef struct {
-    char request_str[1024];  // conterrà la stringa "filepath::fifo_client"
+    char request_str[1024];  // "filepath::fifo_client"
     off_t filesize;
 } Request;
 
@@ -40,22 +38,33 @@ static int queue_size = 0;
 static pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t queue_not_empty = PTHREAD_COND_INITIALIZER;
 
-// Struttura per tracciare uno specifico file in corso di elaborazione
+// Struttura per tracciare elaborazioni in corso
 typedef struct {
     char filepath[1024];
-    int done;                // 0 se calcolo in corso, 1 se completato
-    int wait_count;          // numero di thread attualmente in attesa del risultato
-    char hash_string[65];    // risultato dell'hash (valido se done==1)
-    pthread_cond_t cond;     // condition variable su cui attendono i thread in coda per questo file
+    int done;
+    int wait_count;
+    char hash_string[65];
+    pthread_cond_t cond;
 } InProgressEntry;
 
 static InProgressEntry in_progress_list[MAX_QUEUE];
 static int in_progress_count = 0;
 
-// Strutture per gestire il numero di thread attivi (limite MAX_THREADS)
+// Controllo dei thread attivi
 static pthread_mutex_t thread_count_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t thread_available = PTHREAD_COND_INITIALIZER;
 static int active_threads = 0;
+
+// Prototipi
+void digest_file(const char *filename, uint8_t *hash);
+void cache_insert_unlocked(const char* path, const char* hash);
+int cache_lookup(const char* path, char* hash_out);
+int find_in_progress_index(const char* path);
+void enqueue_request(const char* request_str, off_t filesize);
+int dequeue_request(Request* out);
+void* handle_request(void* arg);
+void* dispatcher_thread(void* arg);
+
 
 /**
  * Calcola l'hash SHA-256 del file specificato.
@@ -102,6 +111,7 @@ void cache_insert_unlocked(const char* path, const char* hash) {
         cache[cache_size].filepath[sizeof(cache[cache_size].filepath) - 1] = '\0';
         strncpy(cache[cache_size].hash_string, hash, sizeof(cache[cache_size].hash_string));
         cache[cache_size].hash_string[64] = '\0';
+        printf("[DEBUG] Inserita in cache: %s → %s (Totale cache: %d)\n", path, hash, cache_size + 1);
         cache_size++;
     } else {
         // Cache piena: in questa implementazione non aggiungiamo nuove voci se la cache ha raggiunto la capacità massima.
@@ -119,6 +129,7 @@ int cache_lookup(const char* path, char* hash_out) {
     pthread_mutex_lock(&cache_mutex);
     for (int i = 0; i < cache_size; i++) {
         if (strcmp(cache[i].filepath, path) == 0) {
+            printf("[DEBUG] Trovato in cache: %s → %s\n", cache[i].filepath, cache[i].hash_string);
             // Copia l'hash trovato e rilascia il mutex
             strcpy(hash_out, cache[i].hash_string);
             pthread_mutex_unlock(&cache_mutex);
@@ -176,6 +187,7 @@ void enqueue_request(const char* request_str, off_t filesize) {
     request_queue[i].request_str[sizeof(request_queue[i].request_str) - 1] = '\0';
     request_queue[i].filesize = filesize;
     queue_size++;
+    printf("[DEBUG] Richiesta accodata: %s (size: %ld). Coda attuale: %d\n", request_str, filesize, queue_size);
 
     // DEBUG opzionale:
     // printf("Inserita richiesta: %s (size: %ld) in posizione %d\n", request_str, filesize, i);
@@ -198,6 +210,7 @@ int dequeue_request(Request* out) {
     }
     // Estrae la prima richiesta (più piccola)
     *out = request_queue[0];
+    printf("[DEBUG] Richiesta estratta: %s (size: %ld). Coda residua: %d\n", out->request_str, out->filesize, queue_size);
     // Shift a sinistra delle restanti richieste in coda
     for (int i = 1; i < queue_size; i++) {
         request_queue[i - 1] = request_queue[i];
@@ -223,6 +236,7 @@ void* handle_request(void* arg) {
         active_threads--;
         pthread_cond_signal(&thread_available);
         pthread_mutex_unlock(&thread_count_mutex);
+
         return NULL;
     }
     *sep = '\0';                     // termina la stringa file path
@@ -374,88 +388,90 @@ void* handle_request(void* arg) {
 /**
  * Thread dispatcher: estrae richieste dalla coda e crea i thread worker rispettando il limite MAX_THREADS.
  */
-void* dispatcher(void* arg) {
-    (void)arg;  // parametro non utilizzato
+void* dispatcher_thread(void* arg) {
+    char buffer[MAX_MSG_SIZE];
+    // Apri FIFO in lettura/scrittura per evitare blocchi
+    int fd_in = open(FIFO_IN, O_RDWR);
+    if (fd_in < 0) {
+        perror("open FIFO_IN");
+        exit(1);
+    }
+
     while (1) {
-        Request req;
-        if (dequeue_request(&req)) {
-            // Attende finché non vi è uno slot libero per un nuovo thread (limite di concurrency)
+        ssize_t len = read(fd_in, buffer, sizeof(buffer) - 1);
+        if (len <= 0) continue;
+        buffer[len] = '\0';
+
+        char *ptr = buffer;
+        while (ptr < buffer + len) {
+            size_t rem = strlen(ptr);
+            if (rem == 0) { ptr++; continue; }
+
+            char *sep = strstr(ptr, "::");
+            if (!sep) {
+                fprintf(stderr, "Richiesta malformata: %s\n", ptr);
+                break;
+            }
+            *sep = '\0';
+            char *filepath   = ptr;
+            char *fifo_client = sep + 2;
+
+            printf("[DEBUG] Letto messaggio: %s → %s\n", filepath, fifo_client);
+
+            // Costruisci stringa di richiesta completa
+            char combined[MAX_MSG_SIZE];
+            snprintf(combined, sizeof(combined), "%s::%s", filepath, fifo_client);
+
+            // Ottieni dimensione del file
+            struct stat st;
+            if (stat(filepath, &st) < 0) {
+                perror("stat file");
+                ptr += rem + 1;
+                continue;
+            }
+
+            // Enqueue richiesta
+            enqueue_request(combined, st.st_size);
+
+            // Dispatch: aspetta slot thread
             pthread_mutex_lock(&thread_count_mutex);
             while (active_threads >= MAX_THREADS) {
                 pthread_cond_wait(&thread_available, &thread_count_mutex);
             }
-            // Riserva uno slot per un nuovo thread
             active_threads++;
             pthread_mutex_unlock(&thread_count_mutex);
 
-            // Crea un nuovo thread per gestire la richiesta estratta
-            char* req_copy = strdup(req.request_str);  // duplica la stringa "filepath::fifo_client"
-            pthread_t tid;
-            if (pthread_create(&tid, NULL, handle_request, req_copy) != 0) {
-                perror("pthread_create");
-                free(req_copy);
-                // In caso di errore nella creazione del thread, libera lo slot riservato
-                pthread_mutex_lock(&thread_count_mutex);
-                active_threads--;
-                pthread_cond_signal(&thread_available);
-                pthread_mutex_unlock(&thread_count_mutex);
-            } else {
-                pthread_detach(tid);  // il thread si occuperà autonomamente della propria terminazione
+            // Prendi richiesta dalla coda
+            Request req;
+            if (dequeue_request(&req)) {
+                // Duplica la stringa per il worker
+                char *arg = strdup(req.request_str);
+                pthread_t tid;
+                pthread_create(&tid, NULL, handle_request, arg);
+                pthread_detach(tid);
             }
+
+            ptr += rem + 1;
         }
     }
+
+    close(fd_in);
     return NULL;
 }
 
 int main() {
-    // Crea la FIFO pubblica di input del server (se già esiste, mkfifo fallisce e viene ignorato)
-    mkfifo(FIFO_IN, 0666);
-    printf("Server in ascolto su %s...\n", FIFO_IN);
-
-    // Avvia il thread dispatcher in background
-    pthread_t disp_tid;
-    if (pthread_create(&disp_tid, NULL, dispatcher, NULL) != 0) {
-        perror("pthread_create dispatcher");
+    unlink(FIFO_IN);
+    if (mkfifo(FIFO_IN, 0666) < 0) {
+        perror("mkfifo");
         return 1;
     }
-    pthread_detach(disp_tid);
 
-    // Loop principale: accetta continuamente richieste dai client tramite FIFO_IN
-int fd_in = open(FIFO_IN, O_RDONLY);
-if (fd_in < 0) {
-    perror("open FIFO_IN");
-    exit(1);
-}
-printf("Server in ascolto su %s...\n", FIFO_IN);
+    printf("Server in ascolto su %s...\n", FIFO_IN);
 
-while (1) {
-char buffer[1024];
-ssize_t len = read(fd_in, buffer, sizeof(buffer) - 1);
-if (len <= 0) continue;
+    pthread_t dispatcher;
+    pthread_create(&dispatcher, NULL, dispatcher_thread, NULL);
+    pthread_join(dispatcher, NULL);
 
-buffer[len] = '\0';
-
-// Estrai filepath da buffer (prima del "::")
-char filepath[1024];
-char* sep = strstr(buffer, "::");
-if (!sep) {
-    fprintf(stderr, "Richiesta malformata: %s\n", buffer);
-    continue;
-}
-size_t path_len = sep - buffer;
-if (path_len >= sizeof(filepath)) path_len = sizeof(filepath) - 1;
-strncpy(filepath, buffer, path_len);
-filepath[path_len] = '\0';
-
-// Ora chiama stat() su solo il percorso file corretto!
-struct stat st;
-if (stat(filepath, &st) == -1) {
-    perror("stat fallita");
-    continue;
-}
-
-// Infine inserisci nella coda
-enqueue_request(buffer, st.st_size);
-
-}
+    unlink(FIFO_IN);
+    return 0;
 }
