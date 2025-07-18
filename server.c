@@ -231,28 +231,26 @@ void* handle_request(void* arg) {
     if (!sep) {
         fprintf(stderr, "Richiesta malformata: %s\n", input);
         free(input);
-        // Decrementa contatore thread attivi e segnala al dispatcher la disponibilità di uno slot
         pthread_mutex_lock(&thread_count_mutex);
         active_threads--;
         pthread_cond_signal(&thread_available);
         pthread_mutex_unlock(&thread_count_mutex);
-
         return NULL;
     }
-    *sep = '\0';                     // termina la stringa file path
+    *sep = '\0';
     char* filepath = input;
-    char* fifo_path = sep + 2;       // inizio del nome FIFO client
+    char* fifo_path = sep + 2;
 
-    char hash_string[65] = "";       // buffer per hash esadecimale (64 caratteri + terminatore)
+    char hash_string[65] = "";
     int need_compute = 0;
 
-    // Sezione critica: verifica se risultato già in cache o se file in elaborazione
     pthread_mutex_lock(&cache_mutex);
     // 1. Controlla la cache per vedere se l'hash è già disponibile
     for (int i = 0; i < cache_size; ++i) {
         if (strcmp(cache[i].filepath, filepath) == 0) {
             strcpy(hash_string, cache[i].hash_string);
             need_compute = 0;
+            printf("[DEBUG] [CACHE_HIT] %s servito dalla cache: %s\n", filepath, hash_string);
             break;
         }
     }
@@ -265,31 +263,26 @@ void* handle_request(void* arg) {
         // 2. Controlla se un thread sta già calcolando l'hash di questo file
         int idx = find_in_progress_index(filepath);
         if (idx != -1) {
-            // Un altro thread è già al lavoro su questo file: attendi il risultato
+            printf("[DEBUG] [WAIT_ON_OTHER] Attendo hash per %s da altro thread...\n", filepath);
             in_progress_list[idx].wait_count++;
             while (in_progress_list[idx].done == 0) {
                 pthread_cond_wait(&in_progress_list[idx].cond, &cache_mutex);
             }
             // Risultato pronto: copia l'hash calcolato dal primo thread
             strcpy(hash_string, in_progress_list[idx].hash_string);
-            // Aggiorna lo stato di attesa di questo thread
+            printf("[DEBUG] [WAIT_ON_OTHER_DONE] Hash per %s ricevuto da altro thread: %s\n", filepath, hash_string);
             in_progress_list[idx].wait_count--;
             if (in_progress_list[idx].done == 1 && in_progress_list[idx].wait_count == 0) {
-                // Se questo era l'ultimo thread in attesa, rimuove l'entry dalla lista
                 pthread_cond_destroy(&in_progress_list[idx].cond);
                 in_progress_list[idx] = in_progress_list[in_progress_count - 1];
                 in_progress_count--;
             }
-            // Rilascia il mutex della cache prima di procedere
             pthread_mutex_unlock(&cache_mutex);
-            // (hash_string ora contiene l'impronta ottenuta dal calcolo concorrente)
         } else {
             // 3. Nessun altro sta elaborando questo file: preparati a calcolarlo
-            // Se la lista in_progress è piena, rimuove eventuali voci completate per fare spazio
             if (in_progress_count >= MAX_QUEUE) {
                 for (int j = 0; j < in_progress_count; ++j) {
                     if (in_progress_list[j].done == 1) {
-                        // Elimina voci marcate come completate (non più necessarie)
                         pthread_cond_destroy(&in_progress_list[j].cond);
                         in_progress_list[j] = in_progress_list[in_progress_count - 1];
                         in_progress_count--;
@@ -297,11 +290,9 @@ void* handle_request(void* arg) {
                     }
                 }
                 if (in_progress_count >= MAX_QUEUE) {
-                    // Se ancora non c'è spazio, non può accettare la richiesta (caso molto improbabile dato il limite thread)
                     fprintf(stderr, "Troppe richieste in elaborazione: impossibile gestire %s\n", filepath);
                     pthread_mutex_unlock(&cache_mutex);
                     free(input);
-                    // Aggiorna contatore thread attivi prima di terminare
                     pthread_mutex_lock(&thread_count_mutex);
                     active_threads--;
                     pthread_cond_signal(&thread_available);
@@ -309,20 +300,18 @@ void* handle_request(void* arg) {
                     return NULL;
                 }
             }
-            // Aggiunge una nuova entry in_progress per questo file
             int new_idx = in_progress_count++;
             strncpy(in_progress_list[new_idx].filepath, filepath, sizeof(in_progress_list[new_idx].filepath));
             in_progress_list[new_idx].filepath[sizeof(in_progress_list[new_idx].filepath) - 1] = '\0';
             in_progress_list[new_idx].done = 0;
             in_progress_list[new_idx].wait_count = 0;
             pthread_cond_init(&in_progress_list[new_idx].cond, NULL);
-            // Rilascia il mutex prima di effettuare il calcolo (permette ad altri thread di accodarsi)
             pthread_mutex_unlock(&cache_mutex);
 
-            // --- Sezione fuori dal mutex: calcolo intensivo dell'hash ---
+            // --- Calcolo effettivo ---
+            printf("[DEBUG] [HASH_CALC] Calcolo hash per %s...\n", filepath);
             uint8_t hash[32];
             digest_file(filepath, hash);
-            // Converte l'hash binario di 32 byte in stringa esadecimale di 64 caratteri
             for (int i = 0; i < 32; ++i) {
                 sprintf(hash_string + (i * 2), "%02x", hash[i]);
             }
@@ -330,9 +319,7 @@ void* handle_request(void* arg) {
 
             // Rientra in sezione critica per aggiornare la cache e lo stato condiviso
             pthread_mutex_lock(&cache_mutex);
-            // Inserisce il nuovo risultato nella cache
             cache_insert_unlocked(filepath, hash_string);
-            // Segna come completata l'entry in_progress relativa a questo file
             int comp_idx = -1;
             for (int j = 0; j < in_progress_count; ++j) {
                 if (strcmp(in_progress_list[j].filepath, filepath) == 0 && in_progress_list[j].done == 0) {
@@ -344,29 +331,25 @@ void* handle_request(void* arg) {
                 in_progress_list[comp_idx].done = 1;
                 strcpy(in_progress_list[comp_idx].hash_string, hash_string);
                 if (in_progress_list[comp_idx].wait_count > 0) {
-                    // Sveglia tutti i thread che erano in attesa di questo risultato
                     pthread_cond_broadcast(&in_progress_list[comp_idx].cond);
                 } else {
-                    // Nessun thread era in attesa: si può rimuovere subito l'entry
                     pthread_cond_destroy(&in_progress_list[comp_idx].cond);
                     in_progress_list[comp_idx] = in_progress_list[in_progress_count - 1];
                     in_progress_count--;
                 }
             }
             pthread_mutex_unlock(&cache_mutex);
-            // (hash_string contiene ora l'impronta calcolata da questo thread)
+            printf("[DEBUG] [HASH_CALC_DONE] Hash calcolato per %s: %s\n", filepath, hash_string);
         }
     } else {
-        // Risultato trovato in cache (hash_string già valorizzato)
+        // Risultato trovato in cache
         pthread_mutex_unlock(&cache_mutex);
     }
 
-    // Invia l'hash calcolato (o recuperato) al client tramite la FIFO di risposta indicata
     int fd_out = open(fifo_path, O_WRONLY);
     if (fd_out < 0) {
         perror("open FIFO client per risposta");
         free(input);
-        // Aggiorna contatore thread attivi prima di terminare il thread
         pthread_mutex_lock(&thread_count_mutex);
         active_threads--;
         pthread_cond_signal(&thread_available);
@@ -376,7 +359,6 @@ void* handle_request(void* arg) {
     write(fd_out, hash_string, strlen(hash_string) + 1);
     close(fd_out);
 
-    // Pulizia risorse e aggiornamento contatore thread
     free(input);
     pthread_mutex_lock(&thread_count_mutex);
     active_threads--;
