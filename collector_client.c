@@ -75,7 +75,7 @@ int main(int argc, char *argv[]) {
         unlink(requests[i].fifo_path);
     }
 
-    // Ordina per dimensione crescente
+    // Ordina per dimensione crescente (da il più piccolo al più grande)
     for (int i = 0; i < num_files - 1; i++) {
         for (int j = i + 1; j < num_files; j++) {
             if (requests[i].filesize > requests[j].filesize) {
